@@ -1,0 +1,683 @@
+import { AppDataSource } from '../config/database';
+import { Attendance, AttendanceStatus } from '../models/Attendance';
+import { Employee } from '../models/Employee';
+import { AttendancePolicy } from '../models/AttendancePolicy';
+import { TimeEntryEdit, TimeEntryEditStatus } from '../models/TimeEntryEdit';
+import { Between, In } from 'typeorm';
+
+export class AttendanceService {
+  private attendanceRepository = AppDataSource.getRepository(Attendance);
+  private employeeRepository = AppDataSource.getRepository(Employee);
+  private policyRepository = AppDataSource.getRepository(AttendancePolicy);
+  private timeEntryEditRepository = AppDataSource.getRepository(TimeEntryEdit);
+
+  /**
+   * Employee: Clock In
+   */
+  async clockIn(
+    employeeId: string,
+    tenantId: string,
+    ipAddress?: string,
+    location?: string
+  ) {
+    if (!employeeId) {
+      throw new Error('Employee profile is required to clock in');
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const employee = await this.employeeRepository.findOne({
+      where: { employeeId, tenantId },
+    });
+
+    if (!employee) {
+      throw new Error('Employee not found');
+    }
+
+    // Check if already clocked in today
+    const existing = await this.attendanceRepository.findOne({
+      where: {
+        employeeId,
+        tenantId,
+        date: today,
+      },
+    });
+
+    if (existing && existing.checkIn) {
+      throw new Error('Already clocked in today');
+    }
+
+    const now = new Date();
+
+    if (existing) {
+      existing.checkIn = now;
+      existing.ipAddress = ipAddress;
+      existing.location = location;
+      existing.status = AttendanceStatus.PRESENT;
+      return await this.attendanceRepository.save(existing);
+    }
+
+    const attendance = this.attendanceRepository.create({
+      employeeId,
+      tenantId,
+      date: today,
+      checkIn: now,
+      status: AttendanceStatus.PRESENT,
+      ipAddress,
+      location,
+    });
+
+    return await this.attendanceRepository.save(attendance);
+  }
+
+  /**
+   * Employee: Clock Out
+   */
+  async clockOut(employeeId: string, tenantId: string) {
+    if (!employeeId) {
+      throw new Error('Employee profile is required to clock out');
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const attendance = await this.attendanceRepository.findOne({
+      where: {
+        employeeId,
+        tenantId,
+        date: today,
+      },
+    });
+
+    if (!attendance) {
+      throw new Error('No clock-in record found for today');
+    }
+
+    if (attendance.checkOut) {
+      throw new Error('Already clocked out today');
+    }
+
+    const now = new Date();
+    attendance.checkOut = now;
+
+    // Calculate work minutes
+    if (attendance.checkIn) {
+      const workMs = now.getTime() - attendance.checkIn.getTime();
+      attendance.workMinutes = Math.floor(workMs / 60000); // Convert to minutes
+    }
+
+    // Get policy to determine if it's a half day
+    const employee = await this.employeeRepository.findOne({
+      where: { employeeId, tenantId },
+    });
+
+    if (employee) {
+      const policy = await this.policyRepository.findOne({
+        where: { tenantId: employee.tenantId, isActive: true },
+      });
+
+      if (policy) {
+        // Check if late
+        if (attendance.checkIn) {
+          const checkInTime = attendance.checkIn.getHours() * 60 + attendance.checkIn.getMinutes();
+          const standardCheckInParts = policy.standardCheckIn.split(':');
+          const standardMinutes = parseInt(standardCheckInParts[0]) * 60 + parseInt(standardCheckInParts[1]);
+
+          if (checkInTime > standardMinutes + policy.lateGraceMinutes) {
+            attendance.isLate = true;
+            attendance.lateMinutes = checkInTime - standardMinutes;
+          }
+        }
+
+        // Check if early out
+        const checkOutTime = now.getHours() * 60 + now.getMinutes();
+        const standardCheckOutParts = policy.standardCheckOut.split(':');
+        const standardOutMinutes = parseInt(standardCheckOutParts[0]) * 60 + parseInt(standardCheckOutParts[1]);
+
+        if (checkOutTime < standardOutMinutes - policy.earlyGraceMinutes) {
+          attendance.isEarlyOut = true;
+          attendance.earlyMinutes = standardOutMinutes - checkOutTime;
+        }
+
+        // Determine status based on work minutes
+        if (attendance.workMinutes < policy.halfDayMinutes) {
+          attendance.status = AttendanceStatus.HALF_DAY;
+        } else if (attendance.workMinutes > policy.requiredWorkMinutes) {
+          attendance.overtimeMinutes = attendance.workMinutes - policy.requiredWorkMinutes;
+        }
+      }
+    }
+
+    return await this.attendanceRepository.save(attendance);
+  }
+
+  /**
+   * Employee: Get my attendance history
+   */
+  async getMyAttendance(
+    employeeId: string,
+    tenantId: string,
+    startDate: Date,
+    endDate: Date
+  ) {
+    // Return empty array if no employeeId (admin users without employee records)
+    if (!employeeId) {
+      return [];
+    }
+
+    return await this.attendanceRepository.find({
+      where: {
+        employeeId,
+        tenantId,
+        date: Between(startDate, endDate),
+      },
+      order: {
+        date: 'DESC',
+      },
+    });
+  }
+
+  /**
+   * HR: Bulk update attendance
+   */
+  async bulkUpdateAttendance(
+    tenantId: string,
+    attendanceUpdates: Array<{
+      attendanceId?: string;
+      employeeId?: string;
+      date?: Date | string;
+      status?: AttendanceStatus;
+      checkIn?: Date;
+      checkOut?: Date;
+      notes?: string;
+    }>,
+    overriddenBy: string,
+    overrideReason: string
+  ) {
+    if (!Array.isArray(attendanceUpdates)) {
+      throw new Error('Attendance updates must be an array');
+    }
+
+    const results = [];
+
+    for (const update of attendanceUpdates) {
+      let attendance: Attendance | null = null;
+
+      if (update.attendanceId) {
+        attendance = await this.attendanceRepository.findOne({
+          where: { attendanceId: update.attendanceId, tenantId },
+        });
+      } else if (update.employeeId && update.date) {
+        const date = this.parseDateOnly(update.date, 'date');
+        const employee = await this.employeeRepository.findOne({
+          where: { employeeId: update.employeeId, tenantId },
+        });
+
+        if (!employee) {
+          throw new Error(`Employee not found for attendance update: ${update.employeeId}`);
+        }
+
+        attendance = await this.attendanceRepository.findOne({
+          where: { employeeId: update.employeeId, tenantId, date },
+        });
+
+        if (!attendance) {
+          attendance = this.attendanceRepository.create({
+            employeeId: update.employeeId,
+            tenantId,
+            date,
+            status: AttendanceStatus.ABSENT,
+          });
+        }
+      }
+
+      if (attendance) {
+        const checkIn = update.checkIn
+          ? this.parseDate(update.checkIn, 'checkIn')
+          : undefined;
+        const checkOut = update.checkOut
+          ? this.parseDate(update.checkOut, 'checkOut')
+          : undefined;
+
+        if (update.status) attendance.status = this.normalizeStatus(update.status);
+        if (checkIn) attendance.checkIn = checkIn;
+        if (checkOut) attendance.checkOut = checkOut;
+        if (update.notes) attendance.notes = update.notes;
+
+        attendance.isManualOverride = true;
+        attendance.overriddenBy = overriddenBy;
+        attendance.overriddenAt = new Date();
+        attendance.overrideReason = overrideReason;
+
+        this.recalculateWorkMinutes(attendance);
+
+        const saved = await this.attendanceRepository.save(attendance);
+        results.push(saved);
+      } else {
+        throw new Error('Attendance update must include either attendanceId or employeeId with date');
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * HR: Override attendance status
+   */
+  async overrideAttendance(
+    tenantId: string,
+    attendanceId: string,
+    updates: Partial<Attendance>,
+    overriddenBy: string,
+    overrideReason: string
+  ) {
+    const attendance = await this.attendanceRepository.findOne({
+      where: { attendanceId, tenantId },
+    });
+
+    if (!attendance) {
+      throw new Error('Attendance record not found');
+    }
+
+    const checkIn = updates.checkIn
+      ? this.parseDate(updates.checkIn, 'checkIn')
+      : undefined;
+    const checkOut = updates.checkOut
+      ? this.parseDate(updates.checkOut, 'checkOut')
+      : undefined;
+
+    if (updates.status) attendance.status = this.normalizeStatus(updates.status);
+    if (checkIn) attendance.checkIn = checkIn;
+    if (checkOut) attendance.checkOut = checkOut;
+    if (updates.notes) attendance.notes = updates.notes;
+    attendance.isManualOverride = true;
+    attendance.overriddenBy = overriddenBy;
+    attendance.overriddenAt = new Date();
+    attendance.overrideReason = overrideReason;
+
+    this.recalculateWorkMinutes(attendance);
+
+    return await this.attendanceRepository.save(attendance);
+  }
+
+  /**
+   * HR: Get company-wide attendance for a date range
+   */
+  async getCompanyWideAttendance(
+    tenantId: string,
+    startDate: Date,
+    endDate: Date,
+    departmentId?: string
+  ) {
+    const queryBuilder = this.attendanceRepository
+      .createQueryBuilder('attendance')
+      .leftJoinAndSelect('attendance.employee', 'employee')
+      .leftJoinAndSelect('employee.department', 'department')
+      .leftJoinAndSelect('employee.designation', 'designation')
+      .where('attendance.tenantId = :tenantId', { tenantId })
+      .andWhere('attendance.date BETWEEN :startDate AND :endDate', {
+        startDate,
+        endDate,
+      });
+
+    if (departmentId) {
+      queryBuilder.andWhere('employee.departmentId = :departmentId', {
+        departmentId,
+      });
+    }
+
+    return await queryBuilder.orderBy('attendance.date', 'DESC').getMany();
+  }
+
+  /**
+   * HR: Get attendance statistics
+   */
+  async getAttendanceStatistics(
+    tenantId: string,
+    startDate: Date,
+    endDate: Date
+  ) {
+    const attendance = await this.attendanceRepository.find({
+      where: {
+        tenantId,
+        date: Between(startDate, endDate),
+      },
+    });
+
+    const stats = {
+      totalRecords: attendance.length,
+      present: attendance.filter((a) => a.status === AttendanceStatus.PRESENT)
+        .length,
+      absent: attendance.filter((a) => a.status === AttendanceStatus.ABSENT)
+        .length,
+      halfDay: attendance.filter((a) => a.status === AttendanceStatus.HALF_DAY)
+        .length,
+      onLeave: attendance.filter((a) => a.status === AttendanceStatus.ON_LEAVE)
+        .length,
+      late: attendance.filter((a) => a.isLate).length,
+      earlyOut: attendance.filter((a) => a.isEarlyOut).length,
+      totalWorkMinutes: attendance.reduce(
+        (sum, a) => sum + (a.workMinutes || 0),
+        0
+      ),
+      totalOvertimeMinutes: attendance.reduce(
+        (sum, a) => sum + (a.overtimeMinutes || 0),
+        0
+      ),
+      averageWorkMinutes:
+        attendance.length > 0
+          ? attendance.reduce((sum, a) => sum + (a.workMinutes || 0), 0) /
+            attendance.length
+          : 0,
+    };
+
+    return stats;
+  }
+
+  /**
+   * HR: Get attendance by department
+   */
+  async getAttendanceByDepartment(
+    tenantId: string,
+    startDate: Date,
+    endDate: Date
+  ) {
+    const result = await this.attendanceRepository
+      .createQueryBuilder('attendance')
+      .leftJoin('attendance.employee', 'employee')
+      .leftJoin('employee.department', 'department')
+      .select('department.departmentId', 'departmentId')
+      .addSelect('department.name', 'departmentName')
+      .addSelect('COUNT(*)', 'totalRecords')
+      .addSelect(
+        "SUM(CASE WHEN attendance.status = 'present' THEN 1 ELSE 0 END)",
+        'presentCount'
+      )
+      .addSelect(
+        "SUM(CASE WHEN attendance.status = 'absent' THEN 1 ELSE 0 END)",
+        'absentCount'
+      )
+      .addSelect('SUM(attendance.workMinutes)', 'totalWorkMinutes')
+      .where('attendance.tenantId = :tenantId', { tenantId })
+      .andWhere('attendance.date BETWEEN :startDate AND :endDate', {
+        startDate,
+        endDate,
+      })
+      .groupBy('department.departmentId')
+      .addGroupBy('department.name')
+      .getRawMany();
+
+    return result;
+  }
+
+  /**
+   * Employee: Request time entry regularization
+   */
+  async requestRegularization(
+    employeeId: string,
+    tenantId: string,
+    date: Date,
+    requestedCheckIn?: Date,
+    requestedCheckOut?: Date,
+    reason?: string
+  ) {
+    if (!employeeId) {
+      throw new Error('Employee profile is required to request regularization');
+    }
+
+    const employee = await this.employeeRepository.findOne({
+      where: { employeeId, tenantId },
+    });
+
+    if (!employee) {
+      throw new Error('Employee not found');
+    }
+
+    // Find or create attendance record for the date
+    let attendance = await this.attendanceRepository.findOne({
+      where: { employeeId, tenantId, date },
+    });
+
+    if (!attendance) {
+      attendance = this.attendanceRepository.create({
+        employeeId,
+        tenantId,
+        date,
+        status: AttendanceStatus.ABSENT,
+      });
+      attendance = await this.attendanceRepository.save(attendance);
+    }
+
+    const existingPending = await this.timeEntryEditRepository.findOne({
+      where: {
+        attendanceId: attendance.attendanceId,
+        employeeId,
+        tenantId,
+        status: TimeEntryEditStatus.PENDING,
+      },
+    });
+
+    if (existingPending) {
+      throw new Error('A pending regularization request already exists for this date');
+    }
+
+    // Create time entry edit request
+    const timeEntryEdit = this.timeEntryEditRepository.create({
+      employeeId,
+      tenantId,
+      attendanceId: attendance.attendanceId,
+      originalCheckIn: attendance.checkIn,
+      originalCheckOut: attendance.checkOut,
+      requestedCheckIn,
+      requestedCheckOut,
+      reason: reason || '',
+      status: TimeEntryEditStatus.PENDING,
+    });
+
+    return await this.timeEntryEditRepository.save(timeEntryEdit);
+  }
+
+  /**
+   * Employee: Get my regularization requests
+   */
+  async getMyRegularizationRequests(employeeId: string, tenantId: string) {
+    if (!employeeId) {
+      return [];
+    }
+
+    return await this.timeEntryEditRepository.find({
+      where: { employeeId, tenantId },
+      relations: ['attendance', 'approver'],
+      order: { createdAt: 'DESC' },
+    });
+  }
+
+  /**
+   * Manager/HR: Get pending regularization requests
+   */
+  async getPendingRegularizations(tenantId: string, employeeIds?: string[]) {
+    if (employeeIds && employeeIds.length === 0) {
+      return [];
+    }
+
+    const queryBuilder = this.timeEntryEditRepository
+      .createQueryBuilder('edit')
+      .leftJoinAndSelect('edit.employee', 'employee')
+      .leftJoinAndSelect('edit.attendance', 'attendance')
+      .leftJoinAndSelect('employee.department', 'department')
+      .where('edit.tenantId = :tenantId', { tenantId })
+      .andWhere('edit.status = :status', { status: TimeEntryEditStatus.PENDING });
+
+    if (employeeIds && employeeIds.length > 0) {
+      queryBuilder.andWhere('edit.employeeId IN (:...employeeIds)', { employeeIds });
+    }
+
+    return await queryBuilder.orderBy('edit.createdAt', 'ASC').getMany();
+  }
+
+  /**
+   * Manager/HR: Approve regularization request
+   */
+  async approveRegularization(
+    editId: string,
+    approverId: string | undefined,
+    tenantId: string,
+    comments?: string,
+    allowedEmployeeIds?: string[]
+  ) {
+    const edit = await this.timeEntryEditRepository.findOne({
+      where: { editId, tenantId },
+      relations: ['attendance'],
+    });
+
+    if (!edit) {
+      throw new Error('Regularization request not found');
+    }
+
+    if (edit.status !== TimeEntryEditStatus.PENDING) {
+      throw new Error('Request is not pending');
+    }
+
+    if (allowedEmployeeIds && !allowedEmployeeIds.includes(edit.employeeId)) {
+      throw new Error('You are not authorized to approve this regularization request');
+    }
+
+    if (approverId && approverId === edit.employeeId) {
+      throw new Error('Employee cannot approve their own regularization request');
+    }
+
+    // Update the regularization request
+    edit.status = TimeEntryEditStatus.APPROVED;
+    edit.approverId = approverId;
+    edit.approvedAt = new Date();
+    edit.approverComments = comments;
+
+    await this.timeEntryEditRepository.save(edit);
+
+    // Update the attendance record
+    if (edit.attendance) {
+      if (edit.requestedCheckIn) {
+        edit.attendance.checkIn = edit.requestedCheckIn;
+      }
+      if (edit.requestedCheckOut) {
+        edit.attendance.checkOut = edit.requestedCheckOut;
+      }
+
+      if (edit.attendance.checkIn && edit.attendance.checkOut) {
+        this.recalculateWorkMinutes(edit.attendance);
+        edit.attendance.status = AttendanceStatus.PRESENT;
+      }
+
+      await this.attendanceRepository.save(edit.attendance);
+    }
+
+    return edit;
+  }
+
+  /**
+   * Manager/HR: Reject regularization request
+   */
+  async rejectRegularization(
+    editId: string,
+    approverId: string | undefined,
+    tenantId: string,
+    comments: string,
+    allowedEmployeeIds?: string[]
+  ) {
+    const edit = await this.timeEntryEditRepository.findOne({
+      where: { editId, tenantId },
+    });
+
+    if (!edit) {
+      throw new Error('Regularization request not found');
+    }
+
+    if (edit.status !== TimeEntryEditStatus.PENDING) {
+      throw new Error('Request is not pending');
+    }
+
+    if (allowedEmployeeIds && !allowedEmployeeIds.includes(edit.employeeId)) {
+      throw new Error('You are not authorized to reject this regularization request');
+    }
+
+    if (approverId && approverId === edit.employeeId) {
+      throw new Error('Employee cannot reject their own regularization request');
+    }
+
+    edit.status = TimeEntryEditStatus.REJECTED;
+    edit.approverId = approverId;
+    edit.approvedAt = new Date();
+    edit.approverComments = comments;
+
+    return await this.timeEntryEditRepository.save(edit);
+  }
+
+  /**
+   * Manager: Get team attendance
+   */
+  async getTeamAttendance(
+    tenantId: string,
+    employeeIds: string[],
+    startDate: Date,
+    endDate: Date
+  ) {
+    if (!employeeIds || employeeIds.length === 0) {
+      return [];
+    }
+
+    return await this.attendanceRepository.find({
+      where: {
+        tenantId,
+        employeeId: In(employeeIds),
+        date: Between(startDate, endDate),
+      },
+      relations: ['employee', 'employee.department', 'employee.designation'],
+      order: {
+        date: 'DESC',
+      },
+    });
+  }
+
+  private parseDate(value: Date | string, fieldName: string): Date {
+    const date = value instanceof Date ? value : new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+      throw new Error(`Invalid ${fieldName}`);
+    }
+
+    return date;
+  }
+
+  private parseDateOnly(value: Date | string, fieldName: string): Date {
+    const date = this.parseDate(value, fieldName);
+    date.setHours(0, 0, 0, 0);
+    return date;
+  }
+
+  private normalizeStatus(status: AttendanceStatus | string): AttendanceStatus {
+    const normalized = String(status).replace('-', '_') as AttendanceStatus;
+
+    if (!Object.values(AttendanceStatus).includes(normalized)) {
+      throw new Error(`Invalid attendance status: ${status}`);
+    }
+
+    return normalized;
+  }
+
+  private recalculateWorkMinutes(attendance: Attendance) {
+    if (!attendance.checkIn || !attendance.checkOut) {
+      return;
+    }
+
+    const workMs = attendance.checkOut.getTime() - attendance.checkIn.getTime();
+
+    if (workMs < 0) {
+      throw new Error('Check-out time cannot be before check-in time');
+    }
+
+    attendance.workMinutes = Math.floor(workMs / 60000);
+  }
+}
+
+export default new AttendanceService();

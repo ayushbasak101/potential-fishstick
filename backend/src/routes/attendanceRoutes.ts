@@ -1,0 +1,79 @@
+import { Router } from 'express';
+import attendanceController from '../controllers/attendanceController';
+import { authenticate, authorize } from '../middleware/auth';
+import { UserRole } from '../../../shared/types';
+
+const router = Router();
+
+// Employee routes - All authenticated employees can access
+router.post('/clock-in', authenticate, attendanceController.clockIn);
+router.post('/clock-out', authenticate, attendanceController.clockOut);
+router.get('/my-attendance', authenticate, attendanceController.getMyAttendance);
+
+// HR-only routes - Requires HR role
+router.post(
+  '/bulk-update',
+  authenticate,
+  authorize(UserRole.HR_ADMIN, UserRole.SYSTEM_ADMIN),
+  attendanceController.bulkUpdate
+);
+
+router.put(
+  '/override/:attendanceId',
+  authenticate,
+  authorize(UserRole.HR_ADMIN, UserRole.SYSTEM_ADMIN),
+  attendanceController.overrideAttendance
+);
+
+router.get(
+  '/company-wide',
+  authenticate,
+  authorize(UserRole.HR_ADMIN, UserRole.SYSTEM_ADMIN, UserRole.MANAGER),
+  attendanceController.getCompanyWide
+);
+
+router.get(
+  '/statistics',
+  authenticate,
+  authorize(UserRole.HR_ADMIN, UserRole.SYSTEM_ADMIN),
+  attendanceController.getStatistics
+);
+
+router.get(
+  '/by-department',
+  authenticate,
+  authorize(UserRole.HR_ADMIN, UserRole.SYSTEM_ADMIN),
+  attendanceController.getByDepartment
+);
+
+// Time Entry Edit (Regularization) routes
+router.post('/regularization/request', authenticate, attendanceController.requestRegularization);
+router.get('/regularization/my-requests', authenticate, attendanceController.getMyRegularizationRequests);
+router.get(
+  '/regularization/pending',
+  authenticate,
+  authorize(UserRole.HR_ADMIN, UserRole.SYSTEM_ADMIN, UserRole.MANAGER),
+  attendanceController.getPendingRegularizations
+);
+router.put(
+  '/regularization/:editId/approve',
+  authenticate,
+  authorize(UserRole.HR_ADMIN, UserRole.SYSTEM_ADMIN, UserRole.MANAGER),
+  attendanceController.approveRegularization
+);
+router.put(
+  '/regularization/:editId/reject',
+  authenticate,
+  authorize(UserRole.HR_ADMIN, UserRole.SYSTEM_ADMIN, UserRole.MANAGER),
+  attendanceController.rejectRegularization
+);
+
+// Team attendance (for managers)
+router.get(
+  '/team',
+  authenticate,
+  authorize(UserRole.MANAGER, UserRole.HR_ADMIN, UserRole.SYSTEM_ADMIN),
+  attendanceController.getTeamAttendance
+);
+
+export default router;
